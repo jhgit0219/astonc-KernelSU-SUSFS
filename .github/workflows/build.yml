@@ -38,26 +38,15 @@ jobs:
           git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
           echo "== Makefile version ==" && head -4 kernel/Makefile
 
-      - name: Set up AOSP clang r450784e (tree-pinned)
+      - name: Set up Neutron clang (recent clang, as PixelOS itself uses ~r563880/clang21)
         run: |
-          mkdir -p clang
-          # Try a few refs for the gitiles archive of just this clang dir
-          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive"
-          ok=0
-          for REF in refs/heads/main refs/heads/master refs/heads/android13-release refs/heads/android-13.0.0_r0.1; do
-            echo "trying $BASE/$REF/clang-r450784e.tar.gz"
-            if curl -fsSL "$BASE/$REF/clang-r450784e.tar.gz" -o clang.tar.gz; then ok=1; break; fi
-          done
-          if [ "$ok" != 1 ]; then
-            echo "gitiles failed, falling back to full shallow clone of android13 clang branch"
-            git clone --depth=1 -b android13-release \
-              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang_full
-            cp -a clang_full/clang-r450784e/* clang/
-          else
-            tar -C clang -xzf clang.tar.gz
-          fi
-          echo "$PWD/clang/bin" >> "$GITHUB_PATH"
-          ls clang/bin/clang && clang/bin/clang --version | head -1
+          mkdir -p clang && cd clang
+          curl -LSsO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S            # sync latest Neutron clang
+          ./antman --patch=glibc # host glibc compatibility
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+          ./bin/clang --version | head -2
 
       - name: Add KernelSU-Next
         working-directory: kernel
@@ -86,22 +75,23 @@ jobs:
         run: |
           export ARCH=arm64
           make O=out LLVM=1 ARCH=arm64 gki_defconfig
-          cat >> out/.config <<'EOF'
-          CONFIG_KSU=y
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          EOF
+          # Thin LTO instead of full: same KMI/CFI ABI, far less RAM -> avoids OOM on cloud runner
+          ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN || true
+          ./scripts/config --file out/.config \
+            -e KSU \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -e KSU_SUSFS_TRY_UMOUNT \
+            -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+            -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            -e KSU_SUSFS_SPOOF_BOOTCONFIG \
+            -e KSU_SUSFS_OPEN_REDIRECT
           make O=out LLVM=1 ARCH=arm64 olddefconfig
           echo "== effective KSU/SUSFS config ==" && grep -E "CONFIG_KSU" out/.config | head -40
 
