@@ -62,13 +62,35 @@ jobs:
           cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
           cp ../susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
           cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch .
-          echo "== applying kernel-side SUSFS patch =="
-          patch -p1 < 50_add_susfs_in_gki-android13-5.15.patch
-          echo "== applying KSU-side SUSFS patch =="
+          echo "== applying kernel-side SUSFS patch (tolerate the 2 known include-hunk rejects) =="
+          patch -p1 < 50_add_susfs_in_gki-android13-5.15.patch || true
+
+          echo "== ensure fs/namespace.c susfs include + externs present (idempotent) =="
+          if ! grep -q 'linux/susfs_def.h' fs/namespace.c; then
+            perl -0pi -e 's{(#include "pnode.h")}{#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif\n\n$1}' fs/namespace.c
+          fi
+          if ! grep -q 'susfs_is_current_ksu_domain' fs/namespace.c; then
+            perl -0pi -e 's{(#include "internal.h")}{$1\n\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n#define CL_COPY_MNT_NS BIT(25)\n#endif}' fs/namespace.c
+          fi
+
+          echo "== ensure fs/proc/task_mmu.c susfs include present (idempotent) =="
+          if ! grep -q 'linux/susfs_def.h' fs/proc/task_mmu.c; then
+            perl -0pi -e 's{(#include <asm/elf.h>)}{#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif\n\n$1}' fs/proc/task_mmu.c
+          fi
+
+          echo "== resolve rejects: remove the 2 known ones, fail on anything unexpected =="
+          for r in $(find . -name '*.rej'); do
+            case "$r" in
+              ./fs/namespace.c.rej|./fs/proc/task_mmu.c.rej) echo "known reject handled manually: $r"; rm -f "$r" ;;
+              *) echo "FATAL: unexpected reject $r"; echo "----"; cat "$r"; exit 1 ;;
+            esac
+          done
+
+          echo "== KSU-side SUSFS patch (KSU-Next may already integrate susfs) =="
           KSU_DIR=$(ls -d KernelSU-Next 2>/dev/null || ls -d KernelSU 2>/dev/null)
           cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$KSU_DIR"/
           ( cd "$KSU_DIR" && patch -p1 < 10_enable_susfs_for_ksu.patch ) || \
-            echo "WARN: KSU-side susfs patch did not apply cleanly (KSU-Next may integrate it) — continuing"
+            echo "WARN: KSU-side susfs patch did not apply (KSU-Next likely integrates susfs natively) — continuing"
 
       - name: Configure (gki_defconfig + KSU + SUSFS)
         working-directory: kernel
@@ -94,6 +116,9 @@ jobs:
             -e KSU_SUSFS_OPEN_REDIRECT
           make O=out LLVM=1 ARCH=arm64 olddefconfig
           echo "== effective KSU/SUSFS config ==" && grep -E "CONFIG_KSU" out/.config | head -40
+          grep -q "^CONFIG_KSU=y" out/.config || { echo "FATAL: KSU not enabled"; exit 1; }
+          grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "FATAL: SUSFS not enabled"; exit 1; }
+          grep -q "^CONFIG_LTO_CLANG_THIN=y" out/.config && echo "LTO: thin (ok)"
 
       - name: Build Image
         working-directory: kernel
