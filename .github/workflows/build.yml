@@ -1,0 +1,133 @@
+name: Build astonc KSU-Next + SUSFS (5.15.207)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+
+env:
+  KERNEL_REPO: https://github.com/OnePlus12R-development/android_kernel_oneplus_sm8550
+  KERNEL_BRANCH: sixteen-qpr2         # PixelOS 16 astonc kernel = 5.15.207
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
+  SUSFS_BRANCH: gki-android13-5.15
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex build-essential libssl-dev libelf-dev \
+            git curl zip unzip ca-certificates python3 python-is-python3 \
+            cpio rsync kmod lz4 gzip
+
+      - name: Clone kernel source ($KERNEL_BRANCH = 5.15.207)
+        run: |
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+          echo "== Makefile version ==" && head -4 kernel/Makefile
+
+      - name: Set up AOSP clang r450784e (tree-pinned)
+        run: |
+          mkdir -p clang
+          # Try a few refs for the gitiles archive of just this clang dir
+          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive"
+          ok=0
+          for REF in refs/heads/main refs/heads/master refs/heads/android13-release refs/heads/android-13.0.0_r0.1; do
+            echo "trying $BASE/$REF/clang-r450784e.tar.gz"
+            if curl -fsSL "$BASE/$REF/clang-r450784e.tar.gz" -o clang.tar.gz; then ok=1; break; fi
+          done
+          if [ "$ok" != 1 ]; then
+            echo "gitiles failed, falling back to full shallow clone of android13 clang branch"
+            git clone --depth=1 -b android13-release \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang_full
+            cp -a clang_full/clang-r450784e/* clang/
+          else
+            tar -C clang -xzf clang.tar.gz
+          fi
+          echo "$PWD/clang/bin" >> "$GITHUB_PATH"
+          ls clang/bin/clang && clang/bin/clang --version | head -1
+
+      - name: Add KernelSU-Next
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          echo "== KSU-Next version ==" && (cat KernelSU-Next/kernel/Makefile 2>/dev/null | grep -i version || true)
+
+      - name: Apply SUSFS (kernel-side + KSU-side)
+        working-directory: kernel
+        run: |
+          git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" ../susfs4ksu
+          cp ../susfs4ksu/kernel_patches/fs/susfs.c fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+          cp ../susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch .
+          echo "== applying kernel-side SUSFS patch =="
+          patch -p1 < 50_add_susfs_in_gki-android13-5.15.patch
+          echo "== applying KSU-side SUSFS patch =="
+          KSU_DIR=$(ls -d KernelSU-Next 2>/dev/null || ls -d KernelSU 2>/dev/null)
+          cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$KSU_DIR"/
+          ( cd "$KSU_DIR" && patch -p1 < 10_enable_susfs_for_ksu.patch ) || \
+            echo "WARN: KSU-side susfs patch did not apply cleanly (KSU-Next may integrate it) — continuing"
+
+      - name: Configure (gki_defconfig + KSU + SUSFS)
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          make O=out LLVM=1 ARCH=arm64 gki_defconfig
+          cat >> out/.config <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          EOF
+          make O=out LLVM=1 ARCH=arm64 olddefconfig
+          echo "== effective KSU/SUSFS config ==" && grep -E "CONFIG_KSU" out/.config | head -40
+
+      - name: Build Image
+        working-directory: kernel
+        run: |
+          make O=out LLVM=1 ARCH=arm64 -j"$(nproc)" Image 2>&1 | tee ../build.log | tail -n 60
+          echo "== output =="
+          ls -la out/arch/arm64/boot/
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version" || true
+
+      - name: Package AnyKernel3 zip
+        run: |
+          git clone --depth=1 https://github.com/OnePlusACE3-development/AnyKernel3-aston AnyKernel3 || \
+            git clone --depth=1 https://github.com/Numbersf/AnyKernel3 AnyKernel3
+          rm -rf AnyKernel3/.git
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
+          ( cd AnyKernel3 && zip -r9 ../astonc-KSUN-SUSFS-5.15.207-AK3.zip . )
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: astonc-KSUN-SUSFS-5.15.207
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            astonc-KSUN-SUSFS-5.15.207-AK3.zip
+            build.log
+          if-no-files-found: warn
