@@ -12,6 +12,7 @@ env:
   BRANCH: sixteen-qpr2
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
   SUSFS_BRANCH: gki-android13-5.15
+  KSU_SETUP: https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh
 
 jobs:
   build:
@@ -19,34 +20,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
+      - name: Free disk
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /opt/hostedtoolcache/PyPy || true
+          sudo docker image prune -af || true
           df -h /
 
-      - name: Install deps
+      - name: Deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bc bison flex build-essential \
-            libssl-dev libelf-dev git curl zip unzip ca-certificates python3 python-is-python3 \
-            cpio rsync kmod lz4 gzip
+            libssl-dev libelf-dev git curl wget zip unzip ca-certificates python3 \
+            python-is-python3 cpio rsync kmod lz4 gzip xz-utils
 
-      - name: Clone kernel + modules (siblings, like build_sm8550)
+      - name: Clone kernel + modules (siblings)
         run: |
           git clone --depth=1 -b "$BRANCH" "$KREPO" kernel
           git clone --depth=1 -b "$BRANCH" "$MREPO" kernel-modules
-          echo "== Makefile version ==" && head -4 kernel/Makefile
+          echo "KROOT=$PWD/kernel" >> "$GITHUB_ENV"
+          echo "MROOT=$(readlink -f "$PWD/kernel-modules")" >> "$GITHUB_ENV"
+          head -4 kernel/Makefile
 
-      - name: Overlay oplus module Kconfig dirs into kernel tree
+      - name: Overlay 18 oplus vendor dirs (symlinks into modules repo)
         run: |
-          cd kernel
-          # init/Kconfig sources kernel/oplus_cpu/... which lives in modules oplus/kernel/cpu
-          ln -sfn ../kernel-modules/oplus/kernel/cpu kernel/oplus_cpu || true
-          ls -ld kernel/oplus_cpu && ls kernel/oplus_cpu | head
-          # (more oplus_* symlinks added here as build errors reveal them)
+          cd "$KROOT"
+          mkdir -p drivers/soc/oplus kernel/oplus_cpu
+          ln -sfn "$MROOT/oplus/kernel/cpu/thermal"                                   kernel/oplus_cpu/thermal
+          ln -sfn "$MROOT/oplus/kernel/touchpanel/kernelFwUpdate"                    drivers/base/kernelFwUpdate
+          ln -sfn "$MROOT/oplus/kernel/touchpanel/oplus_touchscreen_v2"              drivers/input/touchscreen/oplus_touchscreen_v2
+          ln -sfn "$MROOT/oplus/kernel/touchpanel/synaptics_hbp"                     drivers/input/touchscreen/synaptics_hbp
+          ln -sfn "$MROOT/oplus/kernel/touchpanel/oplus_touchscreen_v2/touch_custom" drivers/input/touchscreen/touch_custom
+          ln -sfn "$MROOT/oplus/secure/biometrics/fingerprints/bsp/uff/driver"       drivers/input/uff_fp_drivers
+          ln -sfn "$MROOT/oplus/kernel/leds/aw210xx"                                 drivers/leds/aw210xx
+          ln -sfn "$MROOT/oplus/kernel/vibrator/aw8697_haptic"                       drivers/misc/aw8697_haptic
+          ln -sfn "$MROOT/oplus/kernel/device_info/tri_state_key"                    drivers/misc/tri_state_key
+          ln -sfn "$MROOT/oplus/secure/common/bsp/drivers"                           drivers/misc/oplus_secure
+          ln -sfn "$MROOT/oplus/kernel/nfc"                                          drivers/nfc/oplus_nfc
+          ln -sfn "$MROOT/oplus/kernel/charger"                                      drivers/power/oplus
+          ln -sfn "$MROOT/oplus/kernel/boot"                                         drivers/soc/oplus/boot
+          ln -sfn "$MROOT/oplus/kernel/device_info/device_info"                      drivers/soc/oplus/device_info
+          ln -sfn "$MROOT/oplus/kernel/dfr"                                          drivers/soc/oplus/dfr
+          ln -sfn "$MROOT/oplus/kernel/dft"                                          drivers/soc/oplus/dft
+          ln -sfn "$MROOT/oplus/sensor/kernel/oplus_consumer_ir"                     drivers/soc/oplus/oplus_consumer_ir
+          ln -sfn "$MROOT/oplus/sensor/kernel/qcom/sensor"                           drivers/soc/oplus/sensor
+          echo "== verify no dangling links =="
+          for l in kernel/oplus_cpu/thermal drivers/power/oplus drivers/misc/tri_state_key drivers/soc/oplus/sensor drivers/input/touchscreen/synaptics_hbp; do
+            test -e "$l" || { echo "DANGLING: $l"; exit 1; }
+          done
+          echo "all sampled symlinks resolve OK"
 
-      - name: Neutron clang
+      - name: Neutron clang (clang 21, matches ROM's r563880)
         run: |
           mkdir -p clang && cd clang
           curl -LSsO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
@@ -56,20 +80,29 @@ jobs:
           echo "$PWD/bin" >> "$GITHUB_PATH"
           ./bin/clang --version | head -2
 
-      - name: Add KernelSU-Next
-        working-directory: kernel
+      - name: KernelSU-Next (pershoot dev-susfs = SUSFS-integrated fork)
         run: |
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          cd "$KROOT"
+          curl -LSs "$KSU_SETUP" | bash -s dev-susfs
+          grep -RIl "CONFIG_KSU_SUSFS" drivers/kernelsu/ KernelSU-Next/ 2>/dev/null | head -1 \
+            && echo "KSU_SUSFS Kconfig present in fork (good)" \
+            || echo "WARN: KSU_SUSFS not found in fork Kconfig"
 
-      - name: Apply SUSFS
-        working-directory: kernel
+      - name: Apply SUSFS (kernel-side only; 5.15.207 pre-massage)
         run: |
+          cd "$KROOT"
           git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" ../susfs4ksu
-          cp ../susfs4ksu/kernel_patches/fs/susfs.c fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+          cp ../susfs4ksu/kernel_patches/fs/susfs.c                fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/susfs.h     include/linux/
           cp ../susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
           cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch .
-          patch -p1 < 50_add_susfs_in_gki-android13-5.15.patch || true
+          # 5.15.207: patch context assumes these two includes are absent; strip then re-add
+          sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c     || true
+          sed -i '/^#include <trace\/hooks\/mm.h>$/d'  fs/proc/task_mmu.c || true
+          patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android13-5.15.patch || echo "checking rejects"
+          sed -i '/^#include "internal.h"$/a #include <trace/hooks/blk.h>' fs/namespace.c     || true
+          sed -i '/^#include <linux\/pkeys.h>$/a #include <trace/hooks/mm.h>' fs/proc/task_mmu.c || true
+          # include-insertion fallbacks (if the 50-patch hunk missed)
           if ! grep -q 'linux/susfs_def.h' fs/namespace.c; then
             perl -0pi -e 's{(#include "pnode.h")}{#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif\n\n$1}' fs/namespace.c
           fi
@@ -81,51 +114,61 @@ jobs:
           fi
           for r in $(find . -name '*.rej'); do
             case "$r" in
-              ./fs/namespace.c.rej|./fs/proc/task_mmu.c.rej) rm -f "$r" ;;
+              ./fs/namespace.c.rej|./fs/proc/task_mmu.c.rej) echo "known reject handled: $r"; rm -f "$r" ;;
               *) echo "FATAL unexpected reject $r"; cat "$r"; exit 1 ;;
             esac
           done
-          KSU_DIR=$(ls -d KernelSU-Next 2>/dev/null || ls -d KernelSU)
-          cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$KSU_DIR"/
-          ( cd "$KSU_DIR" && patch -p1 < 10_enable_susfs_for_ksu.patch ) || echo "WARN KSU susfs patch skipped"
+          # KSU/SUSFS fragment = EXACTLY the 11 symbols pershoot dev-susfs defines
+          cat > /tmp/ksu_susfs.fragment <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          EOF
+          sed -i 's/^[[:space:]]*//' /tmp/ksu_susfs.fragment   # strip YAML indent
 
-      - name: Configure (gki_defconfig + kalama vendor fragment + KSU/SUSFS)
-        working-directory: kernel
+      - name: Configure (gki_defconfig + kalama + oplus fragments + KSU/SUSFS, thin LTO)
         run: |
+          cd "$KROOT"
+          unset KCONFIG_EXT_PREFIX
           export ARCH=arm64
-          make O=out LLVM=1 ARCH=arm64 gki_defconfig
-          # merge kalama (SD8Gen2) GKI vendor fragment so oplus vendor options match the ROM
-          if [ -f arch/arm64/configs/vendor/kalama_GKI.config ]; then
-            ./scripts/kconfig/merge_config.sh -m -O out out/.config arch/arm64/configs/vendor/kalama_GKI.config || true
-          fi
+          make O=out ARCH=arm64 LLVM=1 gki_defconfig
+          ./scripts/kconfig/merge_config.sh -O out -m -r out/.config \
+            arch/arm64/configs/vendor/kalama_GKI.config \
+            arch/arm64/configs/vendor/oplus/kalama_GKI.config
           ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN || true
-          ./scripts/config --file out/.config \
-            -e KSU -e KSU_SUSFS -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT \
-            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-            -e KSU_SUSFS_SUS_KSTAT -e KSU_SUSFS_TRY_UMOUNT -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
-            -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-            -e KSU_SUSFS_SPOOF_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT
-          make O=out LLVM=1 ARCH=arm64 olddefconfig
-          echo "== KSU/SUSFS ==" && grep -E "^CONFIG_KSU" out/.config | head
-          echo "== oplus built-ins present? ==" && grep -cE "^CONFIG_OPLUS.*=y" out/.config || true
-          grep -q "^CONFIG_KSU=y" out/.config || { echo FATAL KSU off; exit 1; }
-          grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo FATAL SUSFS off; exit 1; }
+          ./scripts/kconfig/merge_config.sh -O out -m -r out/.config /tmp/ksu_susfs.fragment
+          make O=out ARCH=arm64 LLVM=1 olddefconfig
+          echo "OPLUS built-ins: $(grep -cE '^CONFIG_OPLUS_[A-Z0-9_]*=y' out/.config)"
+          grep -E "^CONFIG_KSU" out/.config
+          grep -q '^CONFIG_KSU=y'       out/.config || { echo "FATAL KSU off";   exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y' out/.config || { echo "FATAL SUSFS off"; exit 1; }
+          test "$(grep -cE '^CONFIG_OPLUS_[A-Z0-9_]*=y' out/.config)" -ge 20 || { echo "FATAL: oplus built-ins missing (expected ~25)"; exit 1; }
 
       - name: Build Image
-        working-directory: kernel
         run: |
-          make O=out LLVM=1 ARCH=arm64 -j"$(nproc)" Image 2>&1 | tee ../build.log | tail -n 80
+          cd "$KROOT"
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 100
           ls -la out/arch/arm64/boot/
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version" || true
-          strings out/arch/arm64/boot/Image | grep -m1 -i susfs && echo "SUSFS in Image: yes" || echo "SUSFS in Image: NO"
+          strings out/arch/arm64/boot/Image | grep -m1 -i susfs && echo "SUSFS-in-Image: YES" || { echo "SUSFS-in-Image: NO"; exit 1; }
+          strings out/arch/arm64/boot/Image | grep -m1 -i "KernelSU" && echo "KSU-in-Image: YES" || true
 
       - name: Package AnyKernel3
         run: |
+          cd "$GITHUB_WORKSPACE"
           git clone --depth=1 https://github.com/OnePlusACE3-development/AnyKernel3-aston AnyKernel3 || \
-            git clone --depth=1 https://github.com/Numbersf/AnyKernel3 AnyKernel3
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
           rm -rf AnyKernel3/.git
-          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
-          ( cd AnyKernel3 && zip -r9 ../astonc-KSUN-SUSFS-5.15.207-AK3.zip . )
+          cp "$KROOT/out/arch/arm64/boot/Image" AnyKernel3/Image
+          ( cd AnyKernel3 && zip -r9 ../astonc-KSUN-SUSFS-5.15.207-AK3.zip . -x '.git*' 'README.md' )
 
       - name: Upload
         if: always()
