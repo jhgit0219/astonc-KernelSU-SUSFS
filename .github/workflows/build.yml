@@ -155,24 +155,26 @@ jobs:
           printf -- '-g80a299579459' > .scmversion
           cat .scmversion; echo
 
-      - name: Configure (gki_defconfig + kalama + oplus fragments + KSU/SUSFS, full LTO)
+      - name: Configure (EXACT device /proc/config.gz base + only KSU/SUSFS on top)
         run: |
           cd "$KROOT"
           unset KCONFIG_EXT_PREFIX
           export ARCH=arm64
-          make O=out ARCH=arm64 LLVM=1 gki_defconfig
-          ./scripts/kconfig/merge_config.sh -O out -m -r out/.config \
-            arch/arm64/configs/vendor/kalama_GKI.config \
-            arch/arm64/configs/vendor/oplus/kalama_GKI.config
-          # Keep FULL LTO (gki_defconfig default) to match ROM's CONFIG_LTO_CLANG_FULL -> CFI-compatible with prebuilt oplus vendor modules
+          mkdir -p out
+          # Use the device's real running config -> identical to ROM (all oplus =y, full LTO, CFI,
+          # modversions). This removes config drift as a source of symbol-CRC mismatch; SUSFS is the only delta.
+          cp "$GITHUB_WORKSPACE/configs/astonc_rom_5.15.207.config" out/.config
+          make O=out ARCH=arm64 LLVM=1 olddefconfig
+          # add ONLY KSU + SUSFS
           ./scripts/kconfig/merge_config.sh -O out -m -r out/.config /tmp/ksu_susfs.fragment
           make O=out ARCH=arm64 LLVM=1 olddefconfig
-          grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config || { echo "FATAL: full LTO not set (CFI needs it to match vendor modules)"; exit 1; }
           echo "OPLUS built-ins: $(grep -cE '^CONFIG_OPLUS_[A-Z0-9_]*=y' out/.config)"
           grep -E "^CONFIG_KSU" out/.config
-          grep -q '^CONFIG_KSU=y'       out/.config || { echo "FATAL KSU off";   exit 1; }
-          grep -q '^CONFIG_KSU_SUSFS=y' out/.config || { echo "FATAL SUSFS off"; exit 1; }
-          test "$(grep -cE '^CONFIG_OPLUS_[A-Z0-9_]*=y' out/.config)" -ge 20 || { echo "FATAL: oplus built-ins missing (expected ~25)"; exit 1; }
+          grep -q '^CONFIG_KSU=y'          out/.config || { echo "FATAL KSU off";        exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y'    out/.config || { echo "FATAL SUSFS off";      exit 1; }
+          grep -q '^CONFIG_MODVERSIONS=y'  out/.config || { echo "FATAL modversions off (vermagic needs it)"; exit 1; }
+          grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config || echo "WARN: not full LTO"
+          test "$(grep -cE '^CONFIG_OPLUS_[A-Z0-9_]*=y' out/.config)" -ge 20 || { echo "FATAL: oplus built-ins missing"; exit 1; }
 
       - name: Build Image
         run: |
@@ -200,5 +202,6 @@ jobs:
           path: |
             kernel/out/arch/arm64/boot/Image
             astonc-KSUN-SUSFS-5.15.207-AK3.zip
+            kernel/out/Module.symvers
             build.log
           if-no-files-found: warn
