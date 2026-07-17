@@ -202,6 +202,7 @@ jobs:
           path: |
             kernel/out/arch/arm64/boot/Image
             astonc-KSUN-SUSFS-5.15.207-AK3.zip
+            kernel/out/vmlinux.symvers
             kernel/out/Module.symvers
             build.log
           if-no-files-found: warn
