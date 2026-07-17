@@ -7,8 +7,9 @@ on:
       - '.github/workflows/build.yml'
 
 env:
-  KERNEL_REPO: https://github.com/OnePlus12R-development/android_kernel_oneplus_sm8550
-  KERNEL_BRANCH: sixteen-qpr2         # PixelOS 16 astonc kernel = 5.15.207
+  KREPO: https://github.com/OnePlus12R-development/android_kernel_oneplus_sm8550
+  MREPO: https://github.com/OnePlus12R-development/android_kernel_oneplus_sm8550-modules
+  BRANCH: sixteen-qpr2
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
   SUSFS_BRANCH: gki-android13-5.15
 
@@ -16,35 +17,42 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout this repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Free up disk space
+      - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-          df -h
+          df -h /
 
-      - name: Install build dependencies
+      - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison flex build-essential libssl-dev libelf-dev \
-            git curl zip unzip ca-certificates python3 python-is-python3 \
+          sudo apt-get install -y --no-install-recommends bc bison flex build-essential \
+            libssl-dev libelf-dev git curl zip unzip ca-certificates python3 python-is-python3 \
             cpio rsync kmod lz4 gzip
 
-      - name: Clone kernel source ($KERNEL_BRANCH = 5.15.207)
+      - name: Clone kernel + modules (siblings, like build_sm8550)
         run: |
-          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+          git clone --depth=1 -b "$BRANCH" "$KREPO" kernel
+          git clone --depth=1 -b "$BRANCH" "$MREPO" kernel-modules
           echo "== Makefile version ==" && head -4 kernel/Makefile
 
-      - name: Set up Neutron clang (recent clang, as PixelOS itself uses ~r563880/clang21)
+      - name: Overlay oplus module Kconfig dirs into kernel tree
+        run: |
+          cd kernel
+          # init/Kconfig sources kernel/oplus_cpu/... which lives in modules oplus/kernel/cpu
+          ln -sfn ../kernel-modules/oplus/kernel/cpu kernel/oplus_cpu || true
+          ls -ld kernel/oplus_cpu && ls kernel/oplus_cpu | head
+          # (more oplus_* symlinks added here as build errors reveal them)
+
+      - name: Neutron clang
         run: |
           mkdir -p clang && cd clang
           curl -LSsO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
           chmod +x antman
-          ./antman -S            # sync latest Neutron clang
-          ./antman --patch=glibc # host glibc compatibility
+          ./antman -S
+          ./antman --patch=glibc
           echo "$PWD/bin" >> "$GITHUB_PATH"
           ./bin/clang --version | head -2
 
@@ -52,9 +60,8 @@ jobs:
         working-directory: kernel
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
-          echo "== KSU-Next version ==" && (cat KernelSU-Next/kernel/Makefile 2>/dev/null | grep -i version || true)
 
-      - name: Apply SUSFS (kernel-side + KSU-side)
+      - name: Apply SUSFS
         working-directory: kernel
         run: |
           git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" ../susfs4ksu
@@ -62,73 +69,57 @@ jobs:
           cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
           cp ../susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
           cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch .
-          echo "== applying kernel-side SUSFS patch (tolerate the 2 known include-hunk rejects) =="
           patch -p1 < 50_add_susfs_in_gki-android13-5.15.patch || true
-
-          echo "== ensure fs/namespace.c susfs include + externs present (idempotent) =="
           if ! grep -q 'linux/susfs_def.h' fs/namespace.c; then
             perl -0pi -e 's{(#include "pnode.h")}{#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif\n\n$1}' fs/namespace.c
           fi
           if ! grep -q 'susfs_is_current_ksu_domain' fs/namespace.c; then
             perl -0pi -e 's{(#include "internal.h")}{$1\n\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n#define CL_COPY_MNT_NS BIT(25)\n#endif}' fs/namespace.c
           fi
-
-          echo "== ensure fs/proc/task_mmu.c susfs include present (idempotent) =="
           if ! grep -q 'linux/susfs_def.h' fs/proc/task_mmu.c; then
             perl -0pi -e 's{(#include <asm/elf.h>)}{#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif\n\n$1}' fs/proc/task_mmu.c
           fi
-
-          echo "== resolve rejects: remove the 2 known ones, fail on anything unexpected =="
           for r in $(find . -name '*.rej'); do
             case "$r" in
-              ./fs/namespace.c.rej|./fs/proc/task_mmu.c.rej) echo "known reject handled manually: $r"; rm -f "$r" ;;
-              *) echo "FATAL: unexpected reject $r"; echo "----"; cat "$r"; exit 1 ;;
+              ./fs/namespace.c.rej|./fs/proc/task_mmu.c.rej) rm -f "$r" ;;
+              *) echo "FATAL unexpected reject $r"; cat "$r"; exit 1 ;;
             esac
           done
-
-          echo "== KSU-side SUSFS patch (KSU-Next may already integrate susfs) =="
-          KSU_DIR=$(ls -d KernelSU-Next 2>/dev/null || ls -d KernelSU 2>/dev/null)
+          KSU_DIR=$(ls -d KernelSU-Next 2>/dev/null || ls -d KernelSU)
           cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$KSU_DIR"/
-          ( cd "$KSU_DIR" && patch -p1 < 10_enable_susfs_for_ksu.patch ) || \
-            echo "WARN: KSU-side susfs patch did not apply (KSU-Next likely integrates susfs natively) — continuing"
+          ( cd "$KSU_DIR" && patch -p1 < 10_enable_susfs_for_ksu.patch ) || echo "WARN KSU susfs patch skipped"
 
-      - name: Configure (gki_defconfig + KSU + SUSFS)
+      - name: Configure (gki_defconfig + kalama vendor fragment + KSU/SUSFS)
         working-directory: kernel
         run: |
           export ARCH=arm64
           make O=out LLVM=1 ARCH=arm64 gki_defconfig
-          # Thin LTO instead of full: same KMI/CFI ABI, far less RAM -> avoids OOM on cloud runner
+          # merge kalama (SD8Gen2) GKI vendor fragment so oplus vendor options match the ROM
+          if [ -f arch/arm64/configs/vendor/kalama_GKI.config ]; then
+            ./scripts/kconfig/merge_config.sh -m -O out out/.config arch/arm64/configs/vendor/kalama_GKI.config || true
+          fi
           ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN || true
           ./scripts/config --file out/.config \
-            -e KSU \
-            -e KSU_SUSFS \
-            -e KSU_SUSFS_SUS_PATH \
-            -e KSU_SUSFS_SUS_MOUNT \
-            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
-            -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-            -e KSU_SUSFS_SUS_KSTAT \
-            -e KSU_SUSFS_TRY_UMOUNT \
-            -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
-            -e KSU_SUSFS_SPOOF_UNAME \
-            -e KSU_SUSFS_ENABLE_LOG \
-            -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-            -e KSU_SUSFS_SPOOF_BOOTCONFIG \
-            -e KSU_SUSFS_OPEN_REDIRECT
+            -e KSU -e KSU_SUSFS -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT -e KSU_SUSFS_TRY_UMOUNT -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+            -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            -e KSU_SUSFS_SPOOF_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT
           make O=out LLVM=1 ARCH=arm64 olddefconfig
-          echo "== effective KSU/SUSFS config ==" && grep -E "CONFIG_KSU" out/.config | head -40
-          grep -q "^CONFIG_KSU=y" out/.config || { echo "FATAL: KSU not enabled"; exit 1; }
-          grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "FATAL: SUSFS not enabled"; exit 1; }
-          grep -q "^CONFIG_LTO_CLANG_THIN=y" out/.config && echo "LTO: thin (ok)"
+          echo "== KSU/SUSFS ==" && grep -E "^CONFIG_KSU" out/.config | head
+          echo "== oplus built-ins present? ==" && grep -cE "^CONFIG_OPLUS.*=y" out/.config || true
+          grep -q "^CONFIG_KSU=y" out/.config || { echo FATAL KSU off; exit 1; }
+          grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo FATAL SUSFS off; exit 1; }
 
       - name: Build Image
         working-directory: kernel
         run: |
-          make O=out LLVM=1 ARCH=arm64 -j"$(nproc)" Image 2>&1 | tee ../build.log | tail -n 60
-          echo "== output =="
+          make O=out LLVM=1 ARCH=arm64 -j"$(nproc)" Image 2>&1 | tee ../build.log | tail -n 80
           ls -la out/arch/arm64/boot/
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version" || true
+          strings out/arch/arm64/boot/Image | grep -m1 -i susfs && echo "SUSFS in Image: yes" || echo "SUSFS in Image: NO"
 
-      - name: Package AnyKernel3 zip
+      - name: Package AnyKernel3
         run: |
           git clone --depth=1 https://github.com/OnePlusACE3-development/AnyKernel3-aston AnyKernel3 || \
             git clone --depth=1 https://github.com/Numbersf/AnyKernel3 AnyKernel3
@@ -136,7 +127,7 @@ jobs:
           cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
           ( cd AnyKernel3 && zip -r9 ../astonc-KSUN-SUSFS-5.15.207-AK3.zip . )
 
-      - name: Upload artifacts
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
