@@ -32,7 +32,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bc bison flex build-essential \
             libssl-dev libelf-dev git curl wget zip unzip ca-certificates python3 \
-            python-is-python3 cpio rsync kmod lz4 gzip xz-utils
+            python-is-python3 cpio rsync kmod lz4 gzip xz-utils dwarves
+          pahole --version || true   # provides pahole for CONFIG_DEBUG_INFO_BTF
 
       - name: Clone kernel + modules (siblings)
         run: |
