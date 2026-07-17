@@ -35,7 +35,7 @@ jobs:
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
-          echo "vm.swappiness=100" | sudo tee /proc/sys/vm/swappiness
+          echo 100 | sudo tee /proc/sys/vm/swappiness || true
           free -h
 
       - name: Deps
