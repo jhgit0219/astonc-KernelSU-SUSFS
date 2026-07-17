@@ -27,6 +27,17 @@ jobs:
           sudo docker image prune -af || true
           df -h /
 
+      - name: Add big swap (full-LTO link needs >16GB; match ROM's CONFIG_LTO_CLANG_FULL)
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          echo "vm.swappiness=100" | sudo tee /proc/sys/vm/swappiness
+          free -h
+
       - name: Deps
         run: |
           sudo apt-get update
@@ -144,9 +155,10 @@ jobs:
           ./scripts/kconfig/merge_config.sh -O out -m -r out/.config \
             arch/arm64/configs/vendor/kalama_GKI.config \
             arch/arm64/configs/vendor/oplus/kalama_GKI.config
-          ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN || true
+          # Keep FULL LTO (gki_defconfig default) to match ROM's CONFIG_LTO_CLANG_FULL -> CFI-compatible with prebuilt oplus vendor modules
           ./scripts/kconfig/merge_config.sh -O out -m -r out/.config /tmp/ksu_susfs.fragment
           make O=out ARCH=arm64 LLVM=1 olddefconfig
+          grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config || { echo "FATAL: full LTO not set (CFI needs it to match vendor modules)"; exit 1; }
           echo "OPLUS built-ins: $(grep -cE '^CONFIG_OPLUS_[A-Z0-9_]*=y' out/.config)"
           grep -E "^CONFIG_KSU" out/.config
           grep -q '^CONFIG_KSU=y'       out/.config || { echo "FATAL KSU off";   exit 1; }
