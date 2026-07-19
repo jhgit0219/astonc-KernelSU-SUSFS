@@ -10,7 +10,7 @@ env:
   KREPO: https://github.com/OnePlus12R-development/android_kernel_oneplus_sm8550
   MREPO: https://github.com/OnePlus12R-development/android_kernel_oneplus_sm8550-modules
   BRANCH: sixteen-qpr2
-  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
+  SUSFS_REPO: https://github.com/ShirkNeko/susfs4ksu
   SUSFS_BRANCH: gki-android13-5.15
   SUKISU_SETUP: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh
   SUKISU_PATCH_REPO: https://github.com/ShirkNeko/SukiSU_patch
@@ -93,18 +93,19 @@ jobs:
           echo "$PWD/bin" >> "$GITHUB_PATH"
           ./bin/clang --version | head -2
 
-      - name: SukiSU-Ultra driver (setup.sh main -> clones KernelSU/, symlinks drivers/kernelsu)
+      - name: SukiSU-Ultra driver (setup.sh builtin -> SUSFS Kconfig baked in; ShirkNeko canonical)
         run: |
           cd "$KROOT"
-          curl -LSs "$SUKISU_SETUP" | bash -s main
+          # 'builtin' branch = KSU forced built-in AND SUSFS Kconfig baked into the driver
+          # (main branch lacks the SUSFS menu -> olddefconfig drops CONFIG_KSU_SUSFS).
+          # It ships SukiSU's modern hiding stack: feature/selinux_hide, sucompat, supercall, lsm_hook.
+          curl -LSs "$SUKISU_SETUP" | bash -s builtin
           echo "== SukiSU driver present? =="
           test -e drivers/kernelsu/Kconfig && echo "drivers/kernelsu OK" || { echo "FATAL: SukiSU driver missing"; exit 1; }
-          # SukiSU native inline-hook framework (syscall-table patch + sys_enter tracepoint, no kprobe reg)
-          test -e drivers/kernelsu/hook/syscall_hook_manager.c && echo "SukiSU inline-hook framework present (good)" \
-            || echo "WARN: SukiSU hook framework not found (unexpected layout)"
-          grep -RIl "CONFIG_KSU_SUSFS" drivers/kernelsu/ 2>/dev/null | head -1 \
-            && echo "KSU_SUSFS Kconfig present in SukiSU driver (good)" \
-            || echo "WARN: KSU_SUSFS not found in SukiSU driver Kconfig (susfs 50-patch will add it)"
+          # SUSFS menu MUST be in the driver Kconfig (builtin bakes it in) or the config step fails
+          grep -qE "config KSU_SUSFS$" drivers/kernelsu/Kconfig && echo "SUSFS Kconfig baked into driver (good)" \
+            || { echo "FATAL: CONFIG_KSU_SUSFS menu absent from driver Kconfig (wrong branch?)"; exit 1; }
+          test -e drivers/kernelsu/feature/selinux_hide.c && echo "SukiSU hiding stack present (good)" || echo "note: selinux_hide.c not found"
 
       - name: Apply SUSFS kernel-side patch (v2.2.0; 5.15.207 pre-massage)
         run: |
@@ -201,9 +202,8 @@ jobs:
           grep -q '^CONFIG_KSU=y'             out/.config || { echo "FATAL KSU off"; exit 1; }
           grep -q '^CONFIG_KSU_SUSFS=y'       out/.config || { echo "FATAL SUSFS off"; exit 1; }
           grep -q '^CONFIG_MODVERSIONS=y'     out/.config || { echo "FATAL modversions off (vermagic needs it)"; exit 1; }
-          # SukiSU's inline hook uses sys_enter tracepoint + KPROBES dependency; both must be present
-          grep -q '^CONFIG_KPROBES=y'              out/.config || { echo "FATAL KPROBES off (CONFIG_KSU depends on it)"; exit 1; }
-          grep -q '^CONFIG_HAVE_SYSCALL_TRACEPOINTS=y' out/.config || echo "WARN: HAVE_SYSCALL_TRACEPOINTS not =y (SukiSU tracepoint hook needs it)"
+          # SukiSU builtin uses LSM/sucompat hooks; KPROBES not strictly required but present in our exact config
+          grep -q '^CONFIG_KPROBES=y' out/.config || echo "WARN: KPROBES not =y"
           test "$(grep -cE '^CONFIG_OPLUS_[A-Z0-9_]*=y' out/.config)" -ge 20 || { echo "FATAL: oplus built-ins missing"; exit 1; }
           # Soft checks (warn only): SUSFS sub-options may differ slightly by driver version
           for s in CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
