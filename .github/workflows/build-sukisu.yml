@@ -151,9 +151,9 @@ jobs:
           else
             echo "note: 69_hide_stuff.patch not found (non-fatal)"
           fi
-          # android13-5.15 susfs build-break fix (show_pad -> return 0), if present
-          grep -q 'goto show_pad;' fs/proc/task_mmu.c 2>/dev/null && \
-            sed -i 's/goto show_pad;/return 0;/' fs/proc/task_mmu.c && echo "task_mmu show_pad fix applied" || true
+          # NOTE: do NOT touch fs/proc/task_mmu.c 'show_pad' — on this OnePlus OEM tree that label+goto
+          # is native OEM code (the ShirkNeko 50_add patch does not add it). Rewriting the goto orphaned
+          # the label -> -Werror,-Wunused-label. AOSP-GKI-only fix; harmful here. Leave OEM code as-is.
 
       - name: Build the KSU+SUSFS defconfig fragment (SukiSU, manual hook, no KPM)
         run: |
@@ -214,7 +214,13 @@ jobs:
       - name: Build Image
         run: |
           cd "$KROOT"
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 100
+          set -o pipefail
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 60 || true
+          if [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "======== BUILD FAILED — compile errors from full build.log ========"
+            grep -nE "error:|Error [0-9]|undefined reference|No such file" "$GITHUB_WORKSPACE/build.log" | grep -viE "warning|Werror=" | tail -40
+            exit 1
+          fi
           ls -la out/arch/arm64/boot/
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version" || true
           strings out/arch/arm64/boot/Image | grep -m1 -i susfs && echo "SUSFS-in-Image: YES" || { echo "SUSFS-in-Image: NO"; exit 1; }
