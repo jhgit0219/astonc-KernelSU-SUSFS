@@ -1,4 +1,4 @@
-name: Build astonc SukiSU-Ultra + SUSFS (5.15.207, manual hooks)
+name: Build astonc SukiSU-Ultra + SUSFS (5.15.207)
 
 on:
   workflow_dispatch:
@@ -99,12 +99,12 @@ jobs:
           curl -LSs "$SUKISU_SETUP" | bash -s main
           echo "== SukiSU driver present? =="
           test -e drivers/kernelsu/Kconfig && echo "drivers/kernelsu OK" || { echo "FATAL: SukiSU driver missing"; exit 1; }
-          grep -RIl "CONFIG_KSU_MANUAL_HOOK" drivers/kernelsu/ 2>/dev/null | head -1 \
-            && echo "MANUAL_HOOK Kconfig present (good)" \
-            || echo "WARN: CONFIG_KSU_MANUAL_HOOK not found in driver Kconfig"
+          # SukiSU native inline-hook framework (syscall-table patch + sys_enter tracepoint, no kprobe reg)
+          test -e drivers/kernelsu/hook/syscall_hook_manager.c && echo "SukiSU inline-hook framework present (good)" \
+            || echo "WARN: SukiSU hook framework not found (unexpected layout)"
           grep -RIl "CONFIG_KSU_SUSFS" drivers/kernelsu/ 2>/dev/null | head -1 \
             && echo "KSU_SUSFS Kconfig present in SukiSU driver (good)" \
-            || echo "WARN: KSU_SUSFS not found in SukiSU driver Kconfig"
+            || echo "WARN: KSU_SUSFS not found in SukiSU driver Kconfig (susfs 50-patch will add it)"
 
       - name: Apply SUSFS kernel-side patch (v2.2.0; 5.15.207 pre-massage)
         run: |
@@ -137,30 +137,18 @@ jobs:
             esac
           done
 
-      - name: Apply SukiSU manual (stealth) syscall hooks + hide patch
+      - name: Apply SukiSU hide patch (69_hide_stuff) — native inline hooks need no manual-hook patch
         run: |
           cd "$KROOT"
-          git clone --depth=1 "$SUKISU_PATCH_REPO" ../SukiSU_patch
-          # scope_min_manual_hooks: compiles ksu_handle_* calls directly into fs/*.c (no kprobe registration)
-          HOOK=$(ls ../SukiSU_patch/hooks/scope_min_manual_hooks_*.patch 2>/dev/null | sort -V | tail -1)
-          echo "using manual-hook patch: $HOOK"
-          test -n "$HOOK" || { echo "FATAL: manual hook patch not found in SukiSU_patch/hooks/"; ls ../SukiSU_patch/hooks/; exit 1; }
-          patch -p1 -F 3 < "$HOOK" || echo "manual-hook patch applied with fuzz/rejects (checking below)"
-          # MANDATORY: without these call-sites, manual-hook root does not function. Verify they landed in fs/.
-          HOOKHITS=$(grep -rl 'ksu_handle' fs/ 2>/dev/null | wc -l)
-          echo "fs/ files with ksu_handle call-sites: $HOOKHITS"
-          if [ "$HOOKHITS" -ge 2 ]; then
-            echo "manual hooks injected into fs/*.c -> OK"; grep -rl 'ksu_handle' fs/ | head
-          else
-            echo "FATAL: manual hook call-sites not found in fs/ after patch (root would not work). Rejects:"
-            find . -name '*.rej' -exec sh -c 'echo "== $1 =="; cat "$1"' _ {} \;
-            exit 1
-          fi
-          grep -q 'ksu_handle' drivers/input/input.c 2>/dev/null && echo "input.c hook OK" || echo "note: input.c hook not present (ok, minor)"
-          # 69_hide_stuff: extra anti-detection hardening (optional; non-fatal)
+          # NOTE: current SukiSU-Ultra (main) hooks via inline syscall-table patching + sys_enter
+          # tracepoint (kernel/hook/, patch_memory.c) — NOT kprobe registration, NOT the old
+          # fs/*.c manual-hook pattern. So we do NOT apply scope_min_manual_hooks (wrong lineage).
+          git clone --depth=1 "$SUKISU_PATCH_REPO" ../SukiSU_patch || true
           if [ -f ../SukiSU_patch/69_hide_stuff.patch ]; then
             patch -p1 -F 3 < ../SukiSU_patch/69_hide_stuff.patch && echo "69_hide_stuff applied" || echo "WARN: 69_hide_stuff had rejects (non-fatal); cleaning"
             find . -name '69_hide_stuff*.rej' -delete 2>/dev/null || true
+          else
+            echo "note: 69_hide_stuff.patch not found (non-fatal)"
           fi
           # android13-5.15 susfs build-break fix (show_pad -> return 0), if present
           grep -q 'goto show_pad;' fs/proc/task_mmu.c 2>/dev/null && \
@@ -170,7 +158,6 @@ jobs:
         run: |
           cat > /tmp/ksu_susfs.fragment <<'EOF'
           CONFIG_KSU=y
-          CONFIG_KSU_MANUAL_HOOK=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
@@ -212,17 +199,17 @@ jobs:
           echo "== resulting KSU/SUSFS config =="; grep -E "^CONFIG_KSU" out/.config || true
           # Hard checks (fatal): the essentials that must be right or it won't boot / won't root
           grep -q '^CONFIG_KSU=y'             out/.config || { echo "FATAL KSU off"; exit 1; }
-          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config || { echo "FATAL manual hook off (kprobe fallback = detectable, and no hooks patched for kprobe)"; exit 1; }
           grep -q '^CONFIG_KSU_SUSFS=y'       out/.config || { echo "FATAL SUSFS off"; exit 1; }
           grep -q '^CONFIG_MODVERSIONS=y'     out/.config || { echo "FATAL modversions off (vermagic needs it)"; exit 1; }
+          # SukiSU's inline hook uses sys_enter tracepoint + KPROBES dependency; both must be present
+          grep -q '^CONFIG_KPROBES=y'              out/.config || { echo "FATAL KPROBES off (CONFIG_KSU depends on it)"; exit 1; }
+          grep -q '^CONFIG_HAVE_SYSCALL_TRACEPOINTS=y' out/.config || echo "WARN: HAVE_SYSCALL_TRACEPOINTS not =y (SukiSU tracepoint hook needs it)"
           test "$(grep -cE '^CONFIG_OPLUS_[A-Z0-9_]*=y' out/.config)" -ge 20 || { echo "FATAL: oplus built-ins missing"; exit 1; }
           # Soft checks (warn only): SUSFS sub-options may differ slightly by driver version
           for s in CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
             grep -q "^$s=y" out/.config || echo "WARN: $s not =y"
           done
           grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config || echo "WARN: not full LTO"
-          # Ensure kprobe SUS_SU path is really off with manual hooks
-          grep -q '^CONFIG_KSU_SUSFS_SUS_SU=y' out/.config && echo "WARN: SUS_SU on (kprobe su path) - unexpected with manual hooks" || echo "SUS_SU off (correct for manual hooks)"
 
       - name: Build Image
         run: |
