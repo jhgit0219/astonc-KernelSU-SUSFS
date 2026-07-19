@@ -1,0 +1,256 @@
+name: Build astonc SukiSU-Ultra + SUSFS (5.15.207, manual hooks)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-sukisu.yml'
+
+env:
+  KREPO: https://github.com/OnePlus12R-development/android_kernel_oneplus_sm8550
+  MREPO: https://github.com/OnePlus12R-development/android_kernel_oneplus_sm8550-modules
+  BRANCH: sixteen-qpr2
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
+  SUSFS_BRANCH: gki-android13-5.15
+  SUKISU_SETUP: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh
+  SUKISU_PATCH_REPO: https://github.com/ShirkNeko/SukiSU_patch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /opt/hostedtoolcache/PyPy || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Add big swap (full-LTO link needs >16GB; match ROM's CONFIG_LTO_CLANG_FULL)
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          echo 100 | sudo tee /proc/sys/vm/swappiness || true
+          free -h
+
+      - name: Deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bc bison flex build-essential \
+            libssl-dev libelf-dev git curl wget zip unzip ca-certificates python3 \
+            python-is-python3 cpio rsync kmod lz4 gzip xz-utils dwarves
+          pahole --version || true   # provides pahole for CONFIG_DEBUG_INFO_BTF
+
+      - name: Clone kernel + modules (siblings)
+        run: |
+          git clone --depth=1 -b "$BRANCH" "$KREPO" kernel
+          git clone --depth=1 -b "$BRANCH" "$MREPO" kernel-modules
+          echo "KROOT=$PWD/kernel" >> "$GITHUB_ENV"
+          echo "MROOT=$(readlink -f "$PWD/kernel-modules")" >> "$GITHUB_ENV"
+          head -4 kernel/Makefile
+
+      - name: Overlay 18 oplus vendor dirs (symlinks into modules repo)
+        run: |
+          cd "$KROOT"
+          mkdir -p drivers/soc/oplus kernel/oplus_cpu
+          ln -sfn "$MROOT/oplus/kernel/cpu/thermal"                                   kernel/oplus_cpu/thermal
+          ln -sfn "$MROOT/oplus/kernel/touchpanel/kernelFwUpdate"                    drivers/base/kernelFwUpdate
+          ln -sfn "$MROOT/oplus/kernel/touchpanel/oplus_touchscreen_v2"              drivers/input/touchscreen/oplus_touchscreen_v2
+          ln -sfn "$MROOT/oplus/kernel/touchpanel/synaptics_hbp"                     drivers/input/touchscreen/synaptics_hbp
+          ln -sfn "$MROOT/oplus/kernel/touchpanel/oplus_touchscreen_v2/touch_custom" drivers/input/touchscreen/touch_custom
+          ln -sfn "$MROOT/oplus/secure/biometrics/fingerprints/bsp/uff/driver"       drivers/input/uff_fp_drivers
+          ln -sfn "$MROOT/oplus/kernel/leds/aw210xx"                                 drivers/leds/aw210xx
+          ln -sfn "$MROOT/oplus/kernel/vibrator/aw8697_haptic"                       drivers/misc/aw8697_haptic
+          ln -sfn "$MROOT/oplus/kernel/device_info/tri_state_key"                    drivers/misc/tri_state_key
+          ln -sfn "$MROOT/oplus/secure/common/bsp/drivers"                           drivers/misc/oplus_secure
+          ln -sfn "$MROOT/oplus/kernel/nfc"                                          drivers/nfc/oplus_nfc
+          ln -sfn "$MROOT/oplus/kernel/charger"                                      drivers/power/oplus
+          ln -sfn "$MROOT/oplus/kernel/boot"                                         drivers/soc/oplus/boot
+          ln -sfn "$MROOT/oplus/kernel/device_info/device_info"                      drivers/soc/oplus/device_info
+          ln -sfn "$MROOT/oplus/kernel/dfr"                                          drivers/soc/oplus/dfr
+          ln -sfn "$MROOT/oplus/kernel/dft"                                          drivers/soc/oplus/dft
+          ln -sfn "$MROOT/oplus/sensor/kernel/oplus_consumer_ir"                     drivers/soc/oplus/oplus_consumer_ir
+          ln -sfn "$MROOT/oplus/sensor/kernel/qcom/sensor"                           drivers/soc/oplus/sensor
+          echo "== verify no dangling links =="
+          for l in kernel/oplus_cpu/thermal drivers/power/oplus drivers/misc/tri_state_key drivers/soc/oplus/sensor drivers/input/touchscreen/synaptics_hbp; do
+            test -e "$l" || { echo "DANGLING: $l"; exit 1; }
+          done
+          echo "all sampled symlinks resolve OK"
+
+      - name: Neutron clang (clang 21, matches ROM's r563880)
+        run: |
+          mkdir -p clang && cd clang
+          curl -LSsO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+          ./antman --patch=glibc
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+          ./bin/clang --version | head -2
+
+      - name: SukiSU-Ultra driver (setup.sh main -> clones KernelSU/, symlinks drivers/kernelsu)
+        run: |
+          cd "$KROOT"
+          curl -LSs "$SUKISU_SETUP" | bash -s main
+          echo "== SukiSU driver present? =="
+          test -e drivers/kernelsu/Kconfig && echo "drivers/kernelsu OK" || { echo "FATAL: SukiSU driver missing"; exit 1; }
+          grep -RIl "CONFIG_KSU_MANUAL_HOOK" drivers/kernelsu/ 2>/dev/null | head -1 \
+            && echo "MANUAL_HOOK Kconfig present (good)" \
+            || echo "WARN: CONFIG_KSU_MANUAL_HOOK not found in driver Kconfig"
+          grep -RIl "CONFIG_KSU_SUSFS" drivers/kernelsu/ 2>/dev/null | head -1 \
+            && echo "KSU_SUSFS Kconfig present in SukiSU driver (good)" \
+            || echo "WARN: KSU_SUSFS not found in SukiSU driver Kconfig"
+
+      - name: Apply SUSFS kernel-side patch (v2.2.0; 5.15.207 pre-massage)
+        run: |
+          cd "$KROOT"
+          git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" ../susfs4ksu
+          cp ../susfs4ksu/kernel_patches/fs/susfs.c                fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/susfs.h     include/linux/
+          cp ../susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch .
+          # 5.15.207: patch context assumes these two includes are absent; strip then re-add
+          sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c     || true
+          sed -i '/^#include <trace\/hooks\/mm.h>$/d'  fs/proc/task_mmu.c || true
+          patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android13-5.15.patch || echo "checking rejects"
+          sed -i '/^#include "internal.h"$/a #include <trace/hooks/blk.h>' fs/namespace.c     || true
+          sed -i '/^#include <linux\/pkeys.h>$/a #include <trace/hooks/mm.h>' fs/proc/task_mmu.c || true
+          # include-insertion fallbacks (if the 50-patch hunk missed)
+          if ! grep -q 'linux/susfs_def.h' fs/namespace.c; then
+            perl -0pi -e 's{(#include "pnode.h")}{#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif\n\n$1}' fs/namespace.c
+          fi
+          if ! grep -q 'susfs_is_current_ksu_domain' fs/namespace.c; then
+            perl -0pi -e 's{(#include "internal.h")}{$1\n\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n#define CL_COPY_MNT_NS BIT(25)\n#endif}' fs/namespace.c
+          fi
+          if ! grep -q 'linux/susfs_def.h' fs/proc/task_mmu.c; then
+            perl -0pi -e 's{(#include <asm/elf.h>)}{#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif\n\n$1}' fs/proc/task_mmu.c
+          fi
+          for r in $(find . -name '*.rej'); do
+            case "$r" in
+              ./fs/namespace.c.rej|./fs/proc/task_mmu.c.rej) echo "known reject handled: $r"; rm -f "$r" ;;
+              *) echo "FATAL unexpected reject $r"; cat "$r"; exit 1 ;;
+            esac
+          done
+
+      - name: Apply SukiSU manual (stealth) syscall hooks + hide patch
+        run: |
+          cd "$KROOT"
+          git clone --depth=1 "$SUKISU_PATCH_REPO" ../SukiSU_patch
+          # scope_min_manual_hooks: compiles ksu_handle_* calls directly into fs/*.c (no kprobe registration)
+          HOOK=$(ls ../SukiSU_patch/hooks/scope_min_manual_hooks_*.patch 2>/dev/null | sort -V | tail -1)
+          echo "using manual-hook patch: $HOOK"
+          test -n "$HOOK" || { echo "FATAL: manual hook patch not found in SukiSU_patch/hooks/"; ls ../SukiSU_patch/hooks/; exit 1; }
+          patch -p1 -F 3 < "$HOOK" || echo "manual-hook patch applied with fuzz/rejects (checking below)"
+          # MANDATORY: without these call-sites, manual-hook root does not function. Verify they landed in fs/.
+          HOOKHITS=$(grep -rl 'ksu_handle' fs/ 2>/dev/null | wc -l)
+          echo "fs/ files with ksu_handle call-sites: $HOOKHITS"
+          if [ "$HOOKHITS" -ge 2 ]; then
+            echo "manual hooks injected into fs/*.c -> OK"; grep -rl 'ksu_handle' fs/ | head
+          else
+            echo "FATAL: manual hook call-sites not found in fs/ after patch (root would not work). Rejects:"
+            find . -name '*.rej' -exec sh -c 'echo "== $1 =="; cat "$1"' _ {} \;
+            exit 1
+          fi
+          grep -q 'ksu_handle' drivers/input/input.c 2>/dev/null && echo "input.c hook OK" || echo "note: input.c hook not present (ok, minor)"
+          # 69_hide_stuff: extra anti-detection hardening (optional; non-fatal)
+          if [ -f ../SukiSU_patch/69_hide_stuff.patch ]; then
+            patch -p1 -F 3 < ../SukiSU_patch/69_hide_stuff.patch && echo "69_hide_stuff applied" || echo "WARN: 69_hide_stuff had rejects (non-fatal); cleaning"
+            find . -name '69_hide_stuff*.rej' -delete 2>/dev/null || true
+          fi
+          # android13-5.15 susfs build-break fix (show_pad -> return 0), if present
+          grep -q 'goto show_pad;' fs/proc/task_mmu.c 2>/dev/null && \
+            sed -i 's/goto show_pad;/return 0;/' fs/proc/task_mmu.c && echo "task_mmu show_pad fix applied" || true
+
+      - name: Build the KSU+SUSFS defconfig fragment (SukiSU, manual hook, no KPM)
+        run: |
+          cat > /tmp/ksu_susfs.fragment <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_MANUAL_HOOK=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=n
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          EOF
+          sed -i 's/^[[:space:]]*//' /tmp/ksu_susfs.fragment   # strip YAML indent
+          cat /tmp/ksu_susfs.fragment
+
+      - name: Pin version string to match ROM (no -dirty; vendor modules check vermagic)
+        run: |
+          cd "$KROOT"
+          printf -- '-g80a299579459' > .scmversion
+          cat .scmversion; echo
+
+      - name: Configure (EXACT device /proc/config.gz base + only KSU/SUSFS/manual-hook on top)
+        run: |
+          cd "$KROOT"
+          unset KCONFIG_EXT_PREFIX
+          export ARCH=arm64
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/configs/astonc_rom_5.15.207.config" out/.config
+          make O=out ARCH=arm64 LLVM=1 olddefconfig
+          ./scripts/kconfig/merge_config.sh -O out -m -r out/.config /tmp/ksu_susfs.fragment
+          make O=out ARCH=arm64 LLVM=1 olddefconfig
+          echo "OPLUS built-ins: $(grep -cE '^CONFIG_OPLUS_[A-Z0-9_]*=y' out/.config)"
+          echo "== resulting KSU/SUSFS config =="; grep -E "^CONFIG_KSU" out/.config || true
+          # Hard checks (fatal): the essentials that must be right or it won't boot / won't root
+          grep -q '^CONFIG_KSU=y'             out/.config || { echo "FATAL KSU off"; exit 1; }
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config || { echo "FATAL manual hook off (kprobe fallback = detectable, and no hooks patched for kprobe)"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y'       out/.config || { echo "FATAL SUSFS off"; exit 1; }
+          grep -q '^CONFIG_MODVERSIONS=y'     out/.config || { echo "FATAL modversions off (vermagic needs it)"; exit 1; }
+          test "$(grep -cE '^CONFIG_OPLUS_[A-Z0-9_]*=y' out/.config)" -ge 20 || { echo "FATAL: oplus built-ins missing"; exit 1; }
+          # Soft checks (warn only): SUSFS sub-options may differ slightly by driver version
+          for s in CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
+            grep -q "^$s=y" out/.config || echo "WARN: $s not =y"
+          done
+          grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config || echo "WARN: not full LTO"
+          # Ensure kprobe SUS_SU path is really off with manual hooks
+          grep -q '^CONFIG_KSU_SUSFS_SUS_SU=y' out/.config && echo "WARN: SUS_SU on (kprobe su path) - unexpected with manual hooks" || echo "SUS_SU off (correct for manual hooks)"
+
+      - name: Build Image
+        run: |
+          cd "$KROOT"
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 100
+          ls -la out/arch/arm64/boot/
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version" || true
+          strings out/arch/arm64/boot/Image | grep -m1 -i susfs && echo "SUSFS-in-Image: YES" || { echo "SUSFS-in-Image: NO"; exit 1; }
+          strings out/arch/arm64/boot/Image | grep -m1 -iE "KernelSU|SukiSU" && echo "KSU-in-Image: YES" || echo "WARN: KSU string not found (may be hidden)"
+
+      - name: Package AnyKernel3
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth=1 https://github.com/OnePlusACE3-development/AnyKernel3-aston AnyKernel3 || \
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          rm -rf AnyKernel3/.git
+          cp "$KROOT/out/arch/arm64/boot/Image" AnyKernel3/Image
+          ( cd AnyKernel3 && zip -r9 ../astonc-SukiSU-SUSFS-5.15.207-AK3.zip . -x '.git*' 'README.md' )
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: astonc-SukiSU-SUSFS-5.15.207
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            astonc-SukiSU-SUSFS-5.15.207-AK3.zip
+            kernel/out/vmlinux.symvers
+            kernel/out/Module.symvers
+            build.log
+          if-no-files-found: warn
